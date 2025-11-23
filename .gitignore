@@ -1,0 +1,29 @@
+# --- Python Basics ---
+# Byte-compiled / optimized / DLL files
+__pycache__/
+*.py[cod]
+*$py.class
+
+# --- Virtual Environments (CRITICAL) ---
+# Never commit libraries. We use requirements.txt for that.
+venv/
+env/
+.venv/
+.env
+
+# --- Project Specific Outputs ---
+# We ignore the generated chart because it changes every time you run the script
+production_schedule.html
+
+# If you export CSVs or Logs later
+*.csv
+*.log
+
+# --- IDE & System Files ---
+# VS Code settings (optional, but usually good to ignore personal settings)
+.vscode/
+.idea/
+
+# Windows/Mac system files
+Thumbs.db
+.DS_Store
