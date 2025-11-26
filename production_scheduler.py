@@ -2,6 +2,7 @@ import datetime
 import collections
 import time
 import database_handler
+import results_writer      # <--- New import for saving to DB
 import visualize_schedule
 from ortools.sat.python import cp_model
 
@@ -12,12 +13,10 @@ SHIFT_END_HOUR = 16
 SHIFT_END_MIN = 30
 
 # Solver Settings
-SOLVER_TIME_LIMIT_SECONDS = 60.0 
+SOLVER_TIME_LIMIT_SECONDS = 600.0  # Set to 600.0 for production runs
 
 # Strategy Settings
-# True = Pull tasks to start ASAP (Remove gaps)
-# False = Allow tasks to float/delay (Just-In-Time)
-ENABLE_GRAVITY_STRATEGY = True 
+ENABLE_GRAVITY_STRATEGY = True    # True = Pull tasks left (Compact), False = Allow float
 
 SHIFT_DURATION_MINUTES = (SHIFT_END_HOUR * 60 + SHIFT_END_MIN) - (SHIFT_START_HOUR * 60 + SHIFT_START_MIN)
 
@@ -43,11 +42,12 @@ def solve_schedule():
     start_time_perf = time.time()
     print("\n" + "="*80)
     print("🏭 PRODUCTION SCHEDULER - Final Optimized Version")
-    print(f"   > Gravity Strategy: {'ENABLED (ASAP)' if ENABLE_GRAVITY_STRATEGY else 'DISABLED (JIT)'}")
+    print(f"   > Gravity Strategy: {'ENABLED' if ENABLE_GRAVITY_STRATEGY else 'DISABLED'}")
     print("="*80)
 
     # 1. LOAD DATA
     try:
+        # database_handler handles fetching raw data
         raw_orders, bom, resources, groups, mappings = database_handler.get_data()
     except Exception as e:
         print(f"❌ Error loading data: {e}")
@@ -182,8 +182,6 @@ def solve_schedule():
 
     # 7. OBJECTIVE FUNCTION
     print("   > Setting Objectives...")
-    
-    # Objective Components
     total_lateness = model.NewIntVar(0, horizon * len(raw_orders), 'total_lateness')
     if lateness_vars: model.Add(total_lateness == sum(lateness_vars))
 
@@ -206,22 +204,18 @@ def solve_schedule():
             model.AddMinEquality(min_load, total_load_vars)
             model.Add(load_range == max_load - min_load)
 
-    # --- BUILD OBJECTIVE LIST ---
+    # --- WEIGHTED OBJECTIVE ---
     objective_terms = [
-        (total_lateness * 10000),   # 1. Meet Due Dates
-        (makespan * 100),           # 2. Finish Fast
-        (load_range * 50),          # 3. Balance Load
+        (total_lateness * 10000),   # 1. Meet Due Dates (Critical)
+        (makespan * 100),           # 2. Finish Project Fast
+        (load_range * 50),          # 3. Balance Loads
         (max_load * 1)              # 4. Reduce Peak Load
     ]
 
-    # Optional Gravity
     if ENABLE_GRAVITY_STRATEGY:
         total_start_time = model.NewIntVar(0, horizon * len(raw_orders), 'total_start')
         model.Add(total_start_time == sum(t['start'] for t in task_vars.values()))
-        objective_terms.append(total_start_time * 1)
-        print("   > 🧲 Gravity Enabled: Pulling all tasks to start ASAP.")
-    else:
-        print("   > ☁️  Gravity Disabled: Tasks may float (Just-In-Time).")
+        objective_terms.append(total_start_time * 1) # 5. Gravity (Pull Left)
 
     model.Minimize(sum(objective_terms))
 
@@ -235,7 +229,7 @@ def solve_schedule():
     status = solver.Solve(model)
     end_time_perf = time.time()
 
-    # 9. OUTPUT SUMMARY
+    # 9. OUTPUT & SAVE
     if status in (cp_model.OPTIMAL, cp_model.FEASIBLE):
         print("\n" + "="*50)
         print("✅  SCHEDULE COMPLETE")
@@ -245,18 +239,29 @@ def solve_schedule():
         print(f"Total Lateness  : {solver.Value(total_lateness)} min")
         print(f"Project Length  : {solver.Value(makespan)} min")
         
-        print("-" * 50)
-        print(f"{'RESOURCE':<30} | {'LOAD (min)':<12} | {'UTIL %':<10}")
-        print("-" * 50)
-        
         output_list = []
+        db_save_list = []
+        order_start_end = collections.defaultdict(lambda: {'start': float('inf'), 'end': 0})
+
+        # 9a. First pass: Get raw solver values to calculate order totals
+        for oid, info in task_vars.items():
+            start_val = solver.Value(info['start'])
+            end_val = solver.Value(info['end'])
+            order_no = info['data']['OrderNo']
+            
+            order_start_end[order_no]['start'] = min(order_start_end[order_no]['start'], start_val)
+            order_start_end[order_no]['end'] = max(order_start_end[order_no]['end'], end_val)
+
+        # 9b. Second pass: Build Data Lists
         for oid, info in task_vars.items():
             start_val = solver.Value(info['start'])
             end_val = solver.Value(info['end'])
             
             res_name = "Unassigned"
+            res_id_assigned = None
             for sel in info['resource_selections']:
                 if solver.Value(sel['is_selected']):
+                    res_id_assigned = sel['res_id']
                     res_name = res_id_to_name.get(sel['res_id'], str(sel['res_id']))
                     break
             
@@ -267,6 +272,12 @@ def solve_schedule():
             if info['data'].get('DueDate') and real_end > info['data']['DueDate']:
                 is_late = "YES"
 
+            # Order Totals for DB
+            order_no = info['data']['OrderNo']
+            order_start_dt = working_minutes_to_real_time(sim_start_time, order_start_end[order_no]['start'])
+            order_end_dt = working_minutes_to_real_time(sim_start_time, order_start_end[order_no]['end'])
+
+            # For Visualization
             output_list.append({
                 'OrderNo': info['data']['OrderNo'],
                 'OpNo': info['data'].get('OpNo', 0),
@@ -278,7 +289,34 @@ def solve_schedule():
                 'Color': info['data']['OrderNo']
             })
 
-        # Print resource stats
+            # For Database
+            db_save_list.append({
+                'id': info['data']['OrdersId'],
+                'orno': info['data']['OrderNo'],
+                'opno': info['data']['OpNo'],
+                'start_time': real_start,
+                'end_time': real_end,
+                'duration': info['data']['TotalProcessTime'],
+                'op_name': info['data']['OperationName'],
+                'remaining_quan': info['data']['Quantity'],
+                'setup_time': info['data']['TotalSetupTime'],
+                'resource_id': res_id_assigned,
+                'resource_group_id': info['data']['ResourceGroup'],
+                'belongs_to_order': info['data']['BelongsToOrderNo'],
+                'due_date': info['data']['DueDate'],
+                'order_start': order_start_dt,
+                'order_end': order_end_dt,
+                'part_no': info['data']['PartNo'], 
+                'product': info['data']['Product']
+            })
+
+        # 9c. Save to Database
+        results_writer.save_schedule(db_save_list)
+
+        # 9d. Print Stats
+        print("\n" + "-" * 50)
+        print(f"{'RESOURCE':<30} | {'LOAD (min)':<12} | {'UTIL %':<10}")
+        print("-" * 50)
         makespan_val = solver.Value(makespan)
         for res_id, usages in resource_usage_vars.items():
             total_load = sum(solver.Value(u) for u in usages)
@@ -286,7 +324,8 @@ def solve_schedule():
             pct = (total_load / makespan_val * 100) if makespan_val > 0 else 0
             print(f"{res_name:<30} | {total_load:<12} | {pct:.1f}%")
 
-        print("\n   > Generating chart...")
+        # 9e. Visualize
+        print("\n   > Generating visual chart...")
         visualize_schedule.create_gantt_chart(output_list)
     else:
         print("❌ No solution found within the time limit.")
