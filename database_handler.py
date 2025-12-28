@@ -8,10 +8,10 @@ DATABASE = 'BicycleDemo' # Primary database connection
 USER = 'sa'
 PASSWORD = 'evrista_pass359'
 
-def get_data() -> Tuple[List[Dict], List[Dict], List[Dict], List[Dict], List[Dict], List[Dict], List[Dict], List[Dict], List[Dict], List[Dict], List[Dict]]:
+def get_data() -> Tuple[List[Dict], List[Dict], List[Dict], List[Dict], List[Dict], List[Dict], List[Dict], List[Dict], List[Dict], List[Dict], List[Dict], List[Dict], List[Dict], List[Dict]]:
     """
-    Fetches Orders/BOM/Resources from databases, plus Changeover configuration.
-    Returns: orders, bom, resources, groups, mappings, order_attrs, attributes, attr_params, changeover_groups, changeover_times, changeover_data
+    Fetches Orders/BOM/Resources from databases, plus Changeover and Schedule configuration.
+    Returns: orders, bom, resources, groups, mappings, order_attrs, attributes, attr_params, changeover_groups, changeover_times, changeover_data, schedules, shifts, breaks, break_shift_rel
     """
     conn = None
     try:
@@ -146,7 +146,58 @@ def get_data() -> Tuple[List[Dict], List[Dict], List[Dict], List[Dict], List[Dic
         """)
         changeover_data = list(cursor)
 
-        return orders, bom, resources, groups, mappings, order_attrs, attributes, attr_params, changeover_groups, changeover_times, changeover_data
+        # 12. FETCH SCHEDULES
+        print("   > Fetching Schedules (BicycleDemo)...")
+        cursor.execute("""
+            SELECT 
+                id AS ScheduleId,
+                name AS Name,
+                monday AS Monday,
+                tuesday AS Tuesday,
+                wednesday AS Wednesday,
+                thursday AS Thursday,
+                friday AS Friday,
+                saturday AS Saturday,
+                sunday AS Sunday
+            FROM [BicycleDemo].[dbo].[Schedules]
+        """)
+        schedules = list(cursor)
+
+        # 13. FETCH SHIFTS
+        print("   > Fetching Shifts (BicycleDemo)...")
+        cursor.execute("""
+            SELECT 
+                id AS ShiftId,
+                name AS Name,
+                start_time AS StartTime,
+                end_time AS EndTime
+            FROM [BicycleDemo].[dbo].[Shifts]
+        """)
+        shifts = list(cursor)
+
+        # 14. FETCH BREAKS
+        print("   > Fetching Breaks (BicycleDemo)...")
+        cursor.execute("""
+            SELECT 
+                id AS BreakId,
+                name AS Name,
+                start_time AS StartTime,
+                end_time AS EndTime
+            FROM [BicycleDemo].[dbo].[Breaks]
+        """)
+        breaks = list(cursor)
+
+        # 15. FETCH BREAK-SHIFT RELATIONSHIPS
+        print("   > Fetching REL_Break_Shift (BicycleDemo)...")
+        cursor.execute("""
+            SELECT 
+                break_id AS BreakId,
+                shift_id AS ShiftId
+            FROM [BicycleDemo].[dbo].[REL_Break_Shift]
+        """)
+        break_shift_rel = list(cursor)
+
+        return orders, bom, resources, groups, mappings, order_attrs, attributes, attr_params, changeover_groups, changeover_times, changeover_data, schedules, shifts, breaks, break_shift_rel
 
     except pymssql.Error as ex:
         print(f"--- DATABASE ERROR --- : {ex}")

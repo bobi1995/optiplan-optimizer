@@ -48,7 +48,7 @@ def solve_schedule():
     # 1. LOAD DATA
     try:
         # database_handler handles fetching raw data
-        raw_orders, bom, resources, groups, mappings, order_attrs, attributes, attr_params, changeover_groups, changeover_times, changeover_data = database_handler.get_data()
+        raw_orders, bom, resources, groups, mappings, order_attrs, attributes, attr_params, changeover_groups, changeover_times, changeover_data, schedules, shifts, breaks, break_shift_rel = database_handler.get_data()
     except Exception as e:
         print(f"❌ Error loading data: {e}")
         return
@@ -156,6 +156,140 @@ def solve_schedule():
             return max(times)  # Take the biggest time
         else:
             return sum(times)  # Sum all times
+
+    # 2b. BUILD SCHEDULE/SHIFT CALENDAR SYSTEM
+    print("   > Building resource calendars...")
+    
+    # Map shift_id -> shift details
+    shift_map = {s['ShiftId']: s for s in shifts}
+    
+    # Map schedule_id -> schedule details
+    schedule_map = {sch['ScheduleId']: sch for sch in schedules}
+    
+    # Map shift_id -> list of break details
+    shift_breaks = collections.defaultdict(list)
+    break_map = {b['BreakId']: b for b in breaks}
+    for rel in break_shift_rel:
+        if rel['BreakId'] in break_map:
+            shift_breaks[rel['ShiftId']].append(break_map[rel['BreakId']])
+    
+    # Map resource_id -> schedule_id
+    res_to_schedule = {r['ResourcesId']: r.get('schedule_id') for r in resources}
+    
+    def time_to_minutes(time_obj):
+        """Convert time object to minutes since midnight."""
+        if time_obj is None:
+            return 0
+        if isinstance(time_obj, str):
+            # Parse "HH:MM" or "HH:MM:SS"
+            parts = time_obj.split(':')
+            return int(parts[0]) * 60 + int(parts[1])
+        # Assume it's a datetime.time object
+        return time_obj.hour * 60 + time_obj.minute
+    
+    def get_resource_working_minutes_for_date(resource_id, date):
+        """
+        Calculate total working minutes for a resource on a specific date.
+        Returns 0 if resource doesn't work that day.
+        """
+        schedule_id = res_to_schedule.get(resource_id)
+        if not schedule_id or schedule_id not in schedule_map:
+            # No schedule defined, use default
+            return SHIFT_DURATION_MINUTES
+        
+        schedule = schedule_map[schedule_id]
+        
+        # Get weekday (0=Monday, 6=Sunday)
+        weekday = date.weekday()
+        weekday_names = ['Monday', 'Tuesday', 'Wednesday', 'Thursday', 'Friday', 'Saturday', 'Sunday']
+        shift_id = schedule.get(weekday_names[weekday])
+        
+        if shift_id is None:
+            # Resource doesn't work this day
+            return 0
+        
+        if shift_id not in shift_map:
+            # Shift not found, use default
+            return SHIFT_DURATION_MINUTES
+        
+        shift = shift_map[shift_id]
+        shift_start = time_to_minutes(shift['StartTime'])
+        shift_end = time_to_minutes(shift['EndTime'])
+        
+        # Calculate gross shift duration
+        gross_minutes = shift_end - shift_start
+        if gross_minutes < 0:
+            gross_minutes += 1440  # Handle overnight shifts
+        
+        # Subtract breaks
+        total_break_minutes = 0
+        for brk in shift_breaks.get(shift_id, []):
+            break_start = time_to_minutes(brk['StartTime'])
+            break_end = time_to_minutes(brk['EndTime'])
+            break_duration = break_end - break_start
+            if break_duration < 0:
+                break_duration += 1440
+            total_break_minutes += break_duration
+        
+        net_minutes = gross_minutes - total_break_minutes
+        return max(0, net_minutes)
+    
+    def get_shift_start_time_for_date(resource_id, date):
+        """Get the shift start time (minutes from midnight) for a resource on a date."""
+        schedule_id = res_to_schedule.get(resource_id)
+        if not schedule_id or schedule_id not in schedule_map:
+            return SHIFT_START_HOUR * 60 + SHIFT_START_MIN
+        
+        schedule = schedule_map[schedule_id]
+        weekday = date.weekday()
+        weekday_names = ['Monday', 'Tuesday', 'Wednesday', 'Thursday', 'Friday', 'Saturday', 'Sunday']
+        shift_id = schedule.get(weekday_names[weekday])
+        
+        if shift_id is None or shift_id not in shift_map:
+            return SHIFT_START_HOUR * 60 + SHIFT_START_MIN
+        
+        shift = shift_map[shift_id]
+        return time_to_minutes(shift['StartTime'])
+    
+    def working_minutes_to_real_time_for_resource(resource_id, start_datetime, worked_minutes):
+        """
+        Convert working minutes to real datetime for a specific resource,
+        respecting their schedule (working days and shift hours).
+        """
+        if worked_minutes == 0:
+            # Return shift start time for the start date
+            shift_start_mins = get_shift_start_time_for_date(resource_id, start_datetime)
+            return start_datetime.replace(hour=shift_start_mins // 60, minute=shift_start_mins % 60, second=0)
+        
+        current_date = start_datetime
+        remaining_minutes = worked_minutes
+        
+        # Consume working days until we've accounted for all minutes
+        while remaining_minutes > 0:
+            day_minutes = get_resource_working_minutes_for_date(resource_id, current_date)
+            
+            if day_minutes == 0:
+                # Skip non-working day
+                current_date += datetime.timedelta(days=1)
+                continue
+            
+            if remaining_minutes <= day_minutes:
+                # Final day - calculate exact time within this shift
+                shift_start_mins = get_shift_start_time_for_date(resource_id, current_date)
+                final_time = current_date.replace(
+                    hour=shift_start_mins // 60, 
+                    minute=shift_start_mins % 60, 
+                    second=0
+                ) + datetime.timedelta(minutes=remaining_minutes)
+                return final_time
+            else:
+                # Consume entire day and move to next
+                remaining_minutes -= day_minutes
+                current_date += datetime.timedelta(days=1)
+        
+        # Fallback
+        shift_start_mins = get_shift_start_time_for_date(resource_id, current_date)
+        return current_date.replace(hour=shift_start_mins // 60, minute=shift_start_mins % 60, second=0)
 
     ops_by_orderno = collections.defaultdict(list)
     for order in raw_orders:
@@ -449,15 +583,22 @@ def solve_schedule():
                     res_name = res_id_to_name.get(sel['res_id'], str(sel['res_id']))
                     break
             
-            real_start = working_minutes_to_real_time(sim_start_time, start_val)
-            real_end = working_minutes_to_real_time(sim_start_time, end_val)
+            # Use resource-aware time conversion if resource is assigned
+            if res_id_assigned:
+                real_start = working_minutes_to_real_time_for_resource(res_id_assigned, sim_start_time, start_val)
+                real_end = working_minutes_to_real_time_for_resource(res_id_assigned, sim_start_time, end_val)
+            else:
+                # Fallback to default conversion
+                real_start = working_minutes_to_real_time(sim_start_time, start_val)
+                real_end = working_minutes_to_real_time(sim_start_time, end_val)
             
             is_late = "NO"
             if info['data'].get('DueDate') and real_end > info['data']['DueDate']:
                 is_late = "YES"
 
-            # Order Totals for DB
+            # Order Totals for DB (use resource-aware or fallback)
             order_no = info['data']['OrderNo']
+            # For order totals, use the first task's resource if available
             order_start_dt = working_minutes_to_real_time(sim_start_time, order_start_end[order_no]['start'])
             order_end_dt = working_minutes_to_real_time(sim_start_time, order_start_end[order_no]['end'])
             
@@ -468,7 +609,10 @@ def solve_schedule():
             # For Visualization - Add changeover block if exists
             if actual_changeover_mins > 0:
                 changeover_start = real_start
-                changeover_end = working_minutes_to_real_time(sim_start_time, start_val + actual_changeover_mins)
+                if res_id_assigned:
+                    changeover_end = working_minutes_to_real_time_for_resource(res_id_assigned, sim_start_time, start_val + actual_changeover_mins)
+                else:
+                    changeover_end = working_minutes_to_real_time(sim_start_time, start_val + actual_changeover_mins)
                 
                 output_list.append({
                     'OrderNo': f'CHANGEOVER',
