@@ -22,14 +22,22 @@ def create_gantt_chart(scheduled_list: List[Dict[str, Any]]):
     # 2. Calculate Duration to hide text on tiny bars
     df['Duration'] = df['EndTime'] - df['StartTime']
 
-    # 3. Create Labels
-    # 'HoverLabel': Full details for the tooltip
-    df['HoverLabel'] = df['OrderNo'] + "-Op" + df['OpNo'].astype(str) + ": " + df['OpName']
+    # 3. Create Labels based on whether it's changeover or operation
+    def create_hover_label(row):
+        if row['OrderNo'] == 'CHANGEOVER':
+            return f"CHANGEOVER - {row['ChangeoverMins']} minutes"
+        return row['OrderNo'] + "-Op" + str(row['OpNo']) + ": " + row['OpName']
     
-    # 'BarText': Short text for the box (Order No only)
-    # Logic: If duration < 2 hours, leave empty. Otherwise, show OrderNo.
+    df['HoverLabel'] = df.apply(create_hover_label, axis=1)
+    
+    # 'BarText': Short text for the box
     def get_bar_text(row):
-        # 2 hours threshold (approx 0.08 days)
+        if row['OrderNo'] == 'CHANGEOVER':
+            # Show changeover text if duration is reasonable
+            if row['Duration'] >= pd.Timedelta(hours=0.5):
+                return "⚙️"  # Gear icon for changeover
+            return ""
+        # Regular task - 2 hours threshold
         if row['Duration'] < pd.Timedelta(hours=2):
             return "" 
         return row['OrderNo']
@@ -39,21 +47,15 @@ def create_gantt_chart(scheduled_list: List[Dict[str, Any]]):
     # 4. Sort for cleaner chart (Resource > Time)
     df = df.sort_values(by=['ResourceName', 'StartTime'])
 
-    # 5. Create Chart
+    # 5. Create Chart using px.timeline
     fig = px.timeline(
         df,
         x_start="StartTime",
         x_end="EndTime",
         y="ResourceName",
-        color="OrderNo", 
-        
-        # Use a distinct color palette
+        color="OrderNo",
         color_discrete_sequence=px.colors.qualitative.Dark24,
-        
-        # Use the SHORT text for the bar
         text="BarText",
-        
-        # Custom Hover Data
         hover_name="HoverLabel",
         hover_data={
             "OrderNo": True, 
@@ -61,27 +63,36 @@ def create_gantt_chart(scheduled_list: List[Dict[str, Any]]):
             "StartTime": True, 
             "EndTime": True, 
             "IsLate": True,
-            "BarText": False,   # Don't show this in hover
-            "HoverLabel": False # Don't show this in data list (it's the title)
+            "ChangeoverMins": True,
+            "BarText": False,
+            "HoverLabel": False,
+            "Color": False
         },
         title="Production Schedule (Hover for Details)"
     )
 
-    # 6. Visual Fixes
-    fig.update_traces(
-        textposition='inside',      # Force text to stay inside the box
-        insidetextanchor='middle',  # Center the text
-        textfont_size=10            # Make font slightly smaller to fit better
+    # 6. Update colors - make changeover blocks gray
+    fig.for_each_trace(
+        lambda trace: trace.update(marker_color='#808080', name='Changeover') 
+        if trace.name == 'CHANGEOVER' 
+        else trace
     )
 
+    # 7. Visual Fixes
+    fig.update_traces(
+        textposition='inside',
+        insidetextanchor='middle',
+        textfont_size=10
+    )
+    
     fig.update_yaxes(autorange="reversed") 
     fig.update_layout(
         autosize=True, 
         height=400 + (len(df['ResourceName'].unique()) * 40),
         xaxis_title="Date/Time",
         yaxis_title="Resource",
-        bargap=0.1, # Slight gap between rows
-        uniformtext_mode='hide', # Hides text if it still doesn't fit
+        bargap=0.1,
+        uniformtext_mode='hide',
         uniformtext_minsize=8
     )
 
