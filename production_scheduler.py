@@ -48,7 +48,7 @@ def solve_schedule():
     # 1. LOAD DATA
     try:
         # database_handler handles fetching raw data
-        raw_orders, bom, resources, groups, mappings = database_handler.get_data()
+        raw_orders, bom, resources, groups, mappings, order_attrs, attributes, attr_params, changeover_groups, changeover_times, changeover_data, schedules, shifts, breaks, break_shift_rel = database_handler.get_data()
     except Exception as e:
         print(f"❌ Error loading data: {e}")
         return
@@ -63,6 +63,233 @@ def solve_schedule():
     group_to_resources = collections.defaultdict(list)
     for m in mappings:
         group_to_resources[m['ResourceGroupsId']].append(m['ResourcesId'])
+
+    # 2a. BUILD ATTRIBUTE LOOKUP STRUCTURES
+    print("   > Building changeover logic...")
+    attr_param_map = {ap['AttributeParamId']: ap for ap in attr_params}
+    attribute_map = {a['AttributeId']: a for a in attributes}
+    
+    # Map: OrderId -> List of AttributeParamIds
+    order_to_attr_params = collections.defaultdict(list)
+    for oa in order_attrs:
+        order_id = oa['OrderId']
+        if oa['AttributeParamId']:
+            order_to_attr_params[order_id].append(oa['AttributeParamId'])
+    
+    # Map: ResourceId -> ChangeoverGroupId
+    res_to_changeover_group = {}
+    res_accumulative = {}
+    for r in resources:
+        if r.get('ChangeoverGroupId'):
+            res_to_changeover_group[r['ResourcesId']] = r['ChangeoverGroupId']
+        res_accumulative[r['ResourcesId']] = r.get('Accumulative', False)
+    
+    # Build Changeover Matrix: (changeover_group_id, attribute_id, from_param_id, to_param_id) -> setup_time
+    changeover_matrix = {}
+    for cd in changeover_data:
+        key = (cd['ChangeoverGroupId'], cd['AttributeId'], cd['FromAttrParamId'], cd['ToAttrParamId'])
+        # Convert to float and ensure it's a number
+        setup_time = cd.get('SetupTime', 0)
+        changeover_matrix[key] = float(setup_time) if setup_time is not None else 0.0
+    
+    # Build Changeover Times: (changeover_group_id, attribute_id) -> setup_time (when no matrix)
+    changeover_standard = {}
+    for ct in changeover_times:
+        if ct.get('ChangeoverTime') is not None:
+            key = (ct['ChangeoverGroupId'], ct['AttributeId'])
+            changeover_standard[key] = float(ct['ChangeoverTime'])
+    
+    # Function to calculate changeover time between two orders on a resource
+    def get_changeover_time(from_order_id, to_order_id, resource_id):
+        """
+        Calculate the changeover time when transitioning from one order to another on a resource.
+        Returns time in minutes.
+        """
+        if resource_id not in res_to_changeover_group:
+            return 0  # No changeover rules for this resource
+        
+        changeover_group_id = res_to_changeover_group[resource_id]
+        from_params = order_to_attr_params.get(from_order_id, [])
+        to_params = order_to_attr_params.get(to_order_id, [])
+        
+        if not from_params or not to_params:
+            return 0  # No attributes defined
+        
+        times = []
+        
+        # Check all combinations of attributes
+        for to_param_id in to_params:
+            to_param = attr_param_map.get(to_param_id)
+            if not to_param:
+                continue
+            
+            attr_id = to_param['AttributeId']
+            
+            for from_param_id in from_params:
+                from_param = attr_param_map.get(from_param_id)
+                if not from_param or from_param['AttributeId'] != attr_id:
+                    continue  # Must be same attribute type
+                
+                # Same value = 0 changeover
+                if from_param_id == to_param_id:
+                    times.append(0)
+                    continue
+                
+                # Check matrix first
+                matrix_key = (changeover_group_id, attr_id, from_param_id, to_param_id)
+                if matrix_key in changeover_matrix:
+                    setup_time = changeover_matrix[matrix_key]
+                    if setup_time is not None:
+                        times.append(float(setup_time))
+                else:
+                    # Check standard time
+                    standard_key = (changeover_group_id, attr_id)
+                    if standard_key in changeover_standard:
+                        times.append(float(changeover_standard[standard_key]))
+        
+        if not times:
+            return 0
+        
+        # Apply accumulative logic
+        is_accumulative = res_accumulative.get(resource_id, False)
+        if is_accumulative:
+            return max(times)  # Take the biggest time
+        else:
+            return sum(times)  # Sum all times
+
+    # 2b. BUILD SCHEDULE/SHIFT CALENDAR SYSTEM
+    print("   > Building resource calendars...")
+    
+    # Map shift_id -> shift details
+    shift_map = {s['ShiftId']: s for s in shifts}
+    
+    # Map schedule_id -> schedule details
+    schedule_map = {sch['ScheduleId']: sch for sch in schedules}
+    
+    # Map shift_id -> list of break details
+    shift_breaks = collections.defaultdict(list)
+    break_map = {b['BreakId']: b for b in breaks}
+    for rel in break_shift_rel:
+        if rel['BreakId'] in break_map:
+            shift_breaks[rel['ShiftId']].append(break_map[rel['BreakId']])
+    
+    # Map resource_id -> schedule_id
+    res_to_schedule = {r['ResourcesId']: r.get('schedule_id') for r in resources}
+    
+    def time_to_minutes(time_obj):
+        """Convert time object to minutes since midnight."""
+        if time_obj is None:
+            return 0
+        if isinstance(time_obj, str):
+            # Parse "HH:MM" or "HH:MM:SS"
+            parts = time_obj.split(':')
+            return int(parts[0]) * 60 + int(parts[1])
+        # Assume it's a datetime.time object
+        return time_obj.hour * 60 + time_obj.minute
+    
+    def get_resource_working_minutes_for_date(resource_id, date):
+        """
+        Calculate total working minutes for a resource on a specific date.
+        Returns 0 if resource doesn't work that day.
+        """
+        schedule_id = res_to_schedule.get(resource_id)
+        if not schedule_id or schedule_id not in schedule_map:
+            # No schedule defined, use default
+            return SHIFT_DURATION_MINUTES
+        
+        schedule = schedule_map[schedule_id]
+        
+        # Get weekday (0=Monday, 6=Sunday)
+        weekday = date.weekday()
+        weekday_names = ['Monday', 'Tuesday', 'Wednesday', 'Thursday', 'Friday', 'Saturday', 'Sunday']
+        shift_id = schedule.get(weekday_names[weekday])
+        
+        if shift_id is None:
+            # Resource doesn't work this day
+            return 0
+        
+        if shift_id not in shift_map:
+            # Shift not found, use default
+            return SHIFT_DURATION_MINUTES
+        
+        shift = shift_map[shift_id]
+        shift_start = time_to_minutes(shift['StartTime'])
+        shift_end = time_to_minutes(shift['EndTime'])
+        
+        # Calculate gross shift duration
+        gross_minutes = shift_end - shift_start
+        if gross_minutes < 0:
+            gross_minutes += 1440  # Handle overnight shifts
+        
+        # Subtract breaks
+        total_break_minutes = 0
+        for brk in shift_breaks.get(shift_id, []):
+            break_start = time_to_minutes(brk['StartTime'])
+            break_end = time_to_minutes(brk['EndTime'])
+            break_duration = break_end - break_start
+            if break_duration < 0:
+                break_duration += 1440
+            total_break_minutes += break_duration
+        
+        net_minutes = gross_minutes - total_break_minutes
+        return max(0, net_minutes)
+    
+    def get_shift_start_time_for_date(resource_id, date):
+        """Get the shift start time (minutes from midnight) for a resource on a date."""
+        schedule_id = res_to_schedule.get(resource_id)
+        if not schedule_id or schedule_id not in schedule_map:
+            return SHIFT_START_HOUR * 60 + SHIFT_START_MIN
+        
+        schedule = schedule_map[schedule_id]
+        weekday = date.weekday()
+        weekday_names = ['Monday', 'Tuesday', 'Wednesday', 'Thursday', 'Friday', 'Saturday', 'Sunday']
+        shift_id = schedule.get(weekday_names[weekday])
+        
+        if shift_id is None or shift_id not in shift_map:
+            return SHIFT_START_HOUR * 60 + SHIFT_START_MIN
+        
+        shift = shift_map[shift_id]
+        return time_to_minutes(shift['StartTime'])
+    
+    def working_minutes_to_real_time_for_resource(resource_id, start_datetime, worked_minutes):
+        """
+        Convert working minutes to real datetime for a specific resource,
+        respecting their schedule (working days and shift hours).
+        """
+        if worked_minutes == 0:
+            # Return shift start time for the start date
+            shift_start_mins = get_shift_start_time_for_date(resource_id, start_datetime)
+            return start_datetime.replace(hour=shift_start_mins // 60, minute=shift_start_mins % 60, second=0)
+        
+        current_date = start_datetime
+        remaining_minutes = worked_minutes
+        
+        # Consume working days until we've accounted for all minutes
+        while remaining_minutes > 0:
+            day_minutes = get_resource_working_minutes_for_date(resource_id, current_date)
+            
+            if day_minutes == 0:
+                # Skip non-working day
+                current_date += datetime.timedelta(days=1)
+                continue
+            
+            if remaining_minutes <= day_minutes:
+                # Final day - calculate exact time within this shift
+                shift_start_mins = get_shift_start_time_for_date(resource_id, current_date)
+                final_time = current_date.replace(
+                    hour=shift_start_mins // 60, 
+                    minute=shift_start_mins % 60, 
+                    second=0
+                ) + datetime.timedelta(minutes=remaining_minutes)
+                return final_time
+            else:
+                # Consume entire day and move to next
+                remaining_minutes -= day_minutes
+                current_date += datetime.timedelta(days=1)
+        
+        # Fallback
+        shift_start_mins = get_shift_start_time_for_date(resource_id, current_date)
+        return current_date.replace(hour=shift_start_mins // 60, minute=shift_start_mins % 60, second=0)
 
     ops_by_orderno = collections.defaultdict(list)
     for order in raw_orders:
@@ -94,6 +321,9 @@ def solve_schedule():
 
     lateness_vars = []
     resource_usage_vars = collections.defaultdict(list)
+    
+    # Track setup time variables for each task
+    setup_time_vars = {}
 
     for order in raw_orders:
         oid = order['OrdersId']
@@ -106,14 +336,25 @@ def solve_schedule():
 
         start_var = model.NewIntVar(0, horizon, f'start_{oid}')
         end_var = model.NewIntVar(0, horizon, f'end_{oid}')
-        interval_var = model.NewIntervalVar(start_var, duration, end_var, f'interval_{oid}')
+        
+        # Create a variable for the actual setup time (will be determined by sequence)
+        actual_setup_var = model.NewIntVar(0, horizon, f'setup_{oid}')
+        setup_time_vars[oid] = actual_setup_var
+        
+        # Duration now includes variable setup time + fixed process time
+        duration_var = model.NewIntVar(0, horizon, f'duration_{oid}')
+        model.Add(duration_var == actual_setup_var + process_mins)
+        
+        interval_var = model.NewIntervalVar(start_var, duration_var, end_var, f'interval_{oid}')
 
         task_vars[oid] = {
             'start': start_var,
             'end': end_var,
             'interval': interval_var,
             'data': order,
-            'resource_selections': []
+            'resource_selections': [],
+            'process_time': process_mins,
+            'duration_var': duration_var
         }
 
         if order.get('EarliestStartDate'):
@@ -129,11 +370,11 @@ def solve_schedule():
             for res_id in eligible_resources:
                 is_selected = model.NewBoolVar(f'sel_{oid}_{res_id}')
                 literals.append(is_selected)
-                opt_interval = model.NewOptionalIntervalVar(start_var, duration, end_var, is_selected, f'opt_{oid}_{res_id}')
+                opt_interval = model.NewOptionalIntervalVar(start_var, duration_var, end_var, is_selected, f'opt_{oid}_{res_id}')
                 task_vars[oid]['resource_selections'].append({'res_id': res_id, 'is_selected': is_selected, 'interval': opt_interval})
                 
-                usage_var = model.NewIntVar(0, duration, f'usage_{oid}_{res_id}')
-                model.Add(usage_var == duration).OnlyEnforceIf(is_selected)
+                usage_var = model.NewIntVar(0, horizon, f'usage_{oid}_{res_id}')
+                model.Add(usage_var == duration_var).OnlyEnforceIf(is_selected)
                 model.Add(usage_var == 0).OnlyEnforceIf(is_selected.Not())
                 resource_usage_vars[res_id].append(usage_var)
 
@@ -173,12 +414,58 @@ def solve_schedule():
 
     # 6. NO OVERLAP
     res_intervals = collections.defaultdict(list)
+    res_tasks = collections.defaultdict(list)  # Track which tasks can run on each resource
+    
     for oid, info in task_vars.items():
         for sel in info['resource_selections']:
             res_intervals[sel['res_id']].append(sel['interval'])
+            res_tasks[sel['res_id']].append((oid, sel['is_selected']))
+    
     for intervals in res_intervals.values():
         if len(intervals) > 1:
             model.AddNoOverlap(intervals)
+
+    # 6a. SEQUENCE-DEPENDENT SETUP TIMES
+    print("   > Adding changeover constraints...")
+    for res_id, task_list in res_tasks.items():
+        if len(task_list) < 2:
+            continue  # No sequencing needed for single task
+        
+        # For each pair of tasks that could run on this resource
+        for i, (task_i, sel_i) in enumerate(task_list):
+            for j, (task_j, sel_j) in enumerate(task_list):
+                if i == j:
+                    continue
+                
+                # Create a literal: "task_i runs before task_j on this resource"
+                precedence_lit = model.NewBoolVar(f'prec_{task_i}_before_{task_j}_on_{res_id}')
+                
+                # If both tasks are on this resource AND i comes before j
+                both_on_resource = model.NewBoolVar(f'both_{task_i}_{task_j}_on_{res_id}')
+                model.AddBoolAnd([sel_i, sel_j]).OnlyEnforceIf(both_on_resource)
+                model.AddBoolOr([sel_i.Not(), sel_j.Not()]).OnlyEnforceIf(both_on_resource.Not())
+                
+                # If task_i ends before task_j starts, then precedence_lit = True
+                model.Add(task_vars[task_j]['start'] >= task_vars[task_i]['end']).OnlyEnforceIf([both_on_resource, precedence_lit])
+                
+                # Calculate changeover time for this transition
+                changeover_mins = get_changeover_time(task_i, task_j, res_id)
+                
+                # If this precedence is active, the setup time of task_j includes the changeover
+                # We'll use a more sophisticated approach: track if task_j is first on resource
+                
+                # For simplicity, we'll add the constraint:
+                # If task_i immediately precedes task_j on this resource, add changeover to task_j's setup
+                if changeover_mins > 0:
+                    # This is a simplified version - in production you'd want to track immediate predecessors
+                    # For now, if both are on resource and i ends before j starts, add changeover buffer
+                    # Convert to integer for CP-SAT
+                    changeover_mins_int = int(round(changeover_mins))
+                    model.Add(task_vars[task_j]['start'] >= task_vars[task_i]['end'] + changeover_mins_int).OnlyEnforceIf([both_on_resource, precedence_lit])
+    
+    # For now, initialize all setup times to 0 (will be refined with better sequencing logic)
+    for oid in setup_time_vars:
+        model.Add(setup_time_vars[oid] == 0)
 
     # 7. OBJECTIVE FUNCTION
     print("   > Setting Objectives...")
@@ -252,6 +539,37 @@ def solve_schedule():
             order_start_end[order_no]['start'] = min(order_start_end[order_no]['start'], start_val)
             order_start_end[order_no]['end'] = max(order_start_end[order_no]['end'], end_val)
 
+        # 9a.1 Calculate actual changeover times based on solved sequence
+        print("   > Calculating sequence-dependent changeovers...")
+        task_setup_times = {}  # oid -> actual setup time in minutes
+        
+        # Build resource schedules: resource_id -> list of (start_time, end_time, task_id)
+        resource_schedules = collections.defaultdict(list)
+        for oid, info in task_vars.items():
+            start_val = solver.Value(info['start'])
+            end_val = solver.Value(info['end'])
+            for sel in info['resource_selections']:
+                if solver.Value(sel['is_selected']):
+                    resource_schedules[sel['res_id']].append((start_val, end_val, oid))
+                    break
+        
+        # Sort each resource's schedule by start time
+        for res_id in resource_schedules:
+            resource_schedules[res_id].sort(key=lambda x: x[0])
+        
+        # Calculate changeover times
+        for res_id, schedule in resource_schedules.items():
+            for i in range(len(schedule)):
+                if i == 0:
+                    # First task on resource has no changeover
+                    task_setup_times[schedule[i][2]] = 0
+                else:
+                    # Calculate changeover from previous task
+                    prev_task_id = schedule[i-1][2]
+                    curr_task_id = schedule[i][2]
+                    changeover = get_changeover_time(prev_task_id, curr_task_id, res_id)
+                    task_setup_times[curr_task_id] = changeover
+
         # 9b. Second pass: Build Data Lists
         for oid, info in task_vars.items():
             start_val = solver.Value(info['start'])
@@ -265,29 +583,75 @@ def solve_schedule():
                     res_name = res_id_to_name.get(sel['res_id'], str(sel['res_id']))
                     break
             
-            real_start = working_minutes_to_real_time(sim_start_time, start_val)
-            real_end = working_minutes_to_real_time(sim_start_time, end_val)
+            # Use resource-aware time conversion if resource is assigned
+            if res_id_assigned:
+                real_start = working_minutes_to_real_time_for_resource(res_id_assigned, sim_start_time, start_val)
+                real_end = working_minutes_to_real_time_for_resource(res_id_assigned, sim_start_time, end_val)
+            else:
+                # Fallback to default conversion
+                real_start = working_minutes_to_real_time(sim_start_time, start_val)
+                real_end = working_minutes_to_real_time(sim_start_time, end_val)
             
             is_late = "NO"
             if info['data'].get('DueDate') and real_end > info['data']['DueDate']:
                 is_late = "YES"
 
-            # Order Totals for DB
+            # Order Totals for DB (use resource-aware or fallback)
             order_no = info['data']['OrderNo']
+            # For order totals, use the first task's resource if available
             order_start_dt = working_minutes_to_real_time(sim_start_time, order_start_end[order_no]['start'])
             order_end_dt = working_minutes_to_real_time(sim_start_time, order_start_end[order_no]['end'])
+            
+            # Get actual changeover time for this task
+            actual_changeover_mins = task_setup_times.get(oid, 0)
+            actual_changeover_days = actual_changeover_mins / 1440.0  # Convert to days
 
-            # For Visualization
-            output_list.append({
-                'OrderNo': info['data']['OrderNo'],
-                'OpNo': info['data'].get('OpNo', 0),
-                'OpName': info['data']['OperationName'],
-                'ResourceName': res_name,
-                'StartTime': real_start.strftime('%Y-%m-%d %H:%M'),
-                'EndTime': real_end.strftime('%Y-%m-%d %H:%M'),
-                'IsLate': is_late,
-                'Color': info['data']['OrderNo']
-            })
+            # For Visualization - Add changeover block if exists
+            if actual_changeover_mins > 0:
+                changeover_start = real_start
+                if res_id_assigned:
+                    changeover_end = working_minutes_to_real_time_for_resource(res_id_assigned, sim_start_time, start_val + actual_changeover_mins)
+                else:
+                    changeover_end = working_minutes_to_real_time(sim_start_time, start_val + actual_changeover_mins)
+                
+                output_list.append({
+                    'OrderNo': f'CHANGEOVER',
+                    'OpNo': 0,
+                    'OpName': 'CHANGEOVER',
+                    'ResourceName': res_name,
+                    'StartTime': changeover_start.strftime('%Y-%m-%d %H:%M'),
+                    'EndTime': changeover_end.strftime('%Y-%m-%d %H:%M'),
+                    'IsLate': 'NO',
+                    'Color': 'CHANGEOVER',
+                    'ChangeoverMins': int(actual_changeover_mins)
+                })
+                
+                # Add the actual operation block (starting after changeover)
+                operation_start = changeover_end
+                output_list.append({
+                    'OrderNo': info['data']['OrderNo'],
+                    'OpNo': info['data'].get('OpNo', 0),
+                    'OpName': info['data']['OperationName'],
+                    'ResourceName': res_name,
+                    'StartTime': operation_start.strftime('%Y-%m-%d %H:%M'),
+                    'EndTime': real_end.strftime('%Y-%m-%d %H:%M'),
+                    'IsLate': is_late,
+                    'Color': info['data']['OrderNo'],
+                    'ChangeoverMins': 0
+                })
+            else:
+                # No changeover, add task normally
+                output_list.append({
+                    'OrderNo': info['data']['OrderNo'],
+                    'OpNo': info['data'].get('OpNo', 0),
+                    'OpName': info['data']['OperationName'],
+                    'ResourceName': res_name,
+                    'StartTime': real_start.strftime('%Y-%m-%d %H:%M'),
+                    'EndTime': real_end.strftime('%Y-%m-%d %H:%M'),
+                    'IsLate': is_late,
+                    'Color': info['data']['OrderNo'],
+                    'ChangeoverMins': 0
+                })
 
             # For Database
             db_save_list.append({
@@ -299,7 +663,7 @@ def solve_schedule():
                 'duration': info['data']['TotalProcessTime'],
                 'op_name': info['data']['OperationName'],
                 'remaining_quan': info['data']['Quantity'],
-                'setup_time': info['data']['TotalSetupTime'],
+                'setup_time': actual_changeover_days,  # Use calculated changeover time
                 'resource_id': res_id_assigned,
                 'resource_group_id': info['data']['ResourceGroup'],
                 'belongs_to_order': info['data']['BelongsToOrderNo'],
