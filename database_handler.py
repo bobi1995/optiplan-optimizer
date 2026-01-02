@@ -52,14 +52,15 @@ def get_data() -> Tuple[List[Dict], List[Dict], List[Dict], List[Dict], List[Dic
         """)
         groups = list(cursor)
 
-        # 4. FETCH RESOURCES (with changeover_group_id and accumulative)
+        # 4. FETCH RESOURCES (with changeover_group_id, accumulative, and schedule_id)
         print("   > Fetching Resources (BicycleDemo)...")
         cursor.execute("""
             SELECT 
                 id AS ResourcesId, 
                 name AS Name,
                 changeover_group_id AS ChangeoverGroupId,
-                accumulative AS Accumulative
+                accumulative AS Accumulative,
+                schedule_id AS ScheduleId
             FROM [BicycleDemo].[dbo].[Resources]
         """)
         resources = list(cursor)

@@ -159,6 +159,7 @@ def solve_schedule():
 
     # 2b. BUILD SCHEDULE/SHIFT CALENDAR SYSTEM
     print("   > Building resource calendars...")
+    print("   > Validating schedules and shifts...")
     
     # Map shift_id -> shift details
     shift_map = {s['ShiftId']: s for s in shifts}
@@ -173,8 +174,38 @@ def solve_schedule():
         if rel['BreakId'] in break_map:
             shift_breaks[rel['ShiftId']].append(break_map[rel['BreakId']])
     
-    # Map resource_id -> schedule_id
-    res_to_schedule = {r['ResourcesId']: r.get('schedule_id') for r in resources}
+    # Map resource_id -> schedule_id (note: using ScheduleId from updated query)
+    res_to_schedule = {r['ResourcesId']: r.get('ScheduleId') for r in resources}
+    
+    # Validate and display resource schedules
+    print("\n" + "="*80)
+    print("📅 RESOURCE SCHEDULE OVERVIEW")
+    print("="*80)
+    weekday_names = ['Monday', 'Tuesday', 'Wednesday', 'Thursday', 'Friday', 'Saturday', 'Sunday']
+    for r in resources[:10]:  # Show first 10 resources
+        res_id = r['ResourcesId']
+        res_name = r['Name']
+        schedule_id = r.get('ScheduleId')
+        
+        if not schedule_id or schedule_id not in schedule_map:
+            print(f"{res_name:<25} | No schedule assigned (no work)")
+            continue
+        
+        schedule = schedule_map[schedule_id]
+        schedule_name = schedule.get('Name', 'Unknown')
+        working_days = []
+        
+        for day_name in weekday_names:
+            shift_id = schedule.get(day_name)
+            if shift_id is not None and shift_id in shift_map:
+                shift_info = shift_map[shift_id]
+                working_days.append(f"{day_name[:3]}({shift_info.get('Name', 'N/A')})")
+        
+        if working_days:
+            print(f"{res_name:<25} | Schedule: {schedule_name:<15} | Works: {', '.join(working_days)}")
+        else:
+            print(f"{res_name:<25} | Schedule: {schedule_name:<15} | No working days defined")
+    print("="*80 + "\n")
     
     def time_to_minutes(time_obj):
         """Convert time object to minutes since midnight."""
@@ -194,7 +225,10 @@ def solve_schedule():
         """
         schedule_id = res_to_schedule.get(resource_id)
         if not schedule_id or schedule_id not in schedule_map:
-            # No schedule defined, use default
+            # No schedule defined, use default (but check for NULL schedule - no work)
+            if schedule_id is None:
+                # Explicitly no schedule assigned - assume no work
+                return 0
             return SHIFT_DURATION_MINUTES
         
         schedule = schedule_map[schedule_id]
@@ -205,7 +239,7 @@ def solve_schedule():
         shift_id = schedule.get(weekday_names[weekday])
         
         if shift_id is None:
-            # Resource doesn't work this day
+            # Resource doesn't work this day (NULL in schedule table)
             return 0
         
         if shift_id not in shift_map:
@@ -255,14 +289,24 @@ def solve_schedule():
         """
         Convert working minutes to real datetime for a specific resource,
         respecting their schedule (working days and shift hours).
+        This function ensures tasks only span working days.
         """
         if worked_minutes == 0:
             # Return shift start time for the start date
-            shift_start_mins = get_shift_start_time_for_date(resource_id, start_datetime)
-            return start_datetime.replace(hour=shift_start_mins // 60, minute=shift_start_mins % 60, second=0)
+            # First, find the next working day from start_datetime if it's non-working
+            current_date = start_datetime.replace(hour=0, minute=0, second=0, microsecond=0)
+            while get_resource_working_minutes_for_date(resource_id, current_date) == 0:
+                current_date += datetime.timedelta(days=1)
+            shift_start_mins = get_shift_start_time_for_date(resource_id, current_date)
+            return current_date.replace(hour=shift_start_mins // 60, minute=shift_start_mins % 60, second=0)
         
-        current_date = start_datetime
+        # Start from the beginning of the start date
+        current_date = start_datetime.replace(hour=0, minute=0, second=0, microsecond=0)
         remaining_minutes = worked_minutes
+        
+        # Skip to first working day if starting on non-working day
+        while get_resource_working_minutes_for_date(resource_id, current_date) == 0:
+            current_date += datetime.timedelta(days=1)
         
         # Consume working days until we've accounted for all minutes
         while remaining_minutes > 0:
@@ -287,7 +331,7 @@ def solve_schedule():
                 remaining_minutes -= day_minutes
                 current_date += datetime.timedelta(days=1)
         
-        # Fallback
+        # Fallback - should not reach here
         shift_start_mins = get_shift_start_time_for_date(resource_id, current_date)
         return current_date.replace(hour=shift_start_mins // 60, minute=shift_start_mins % 60, second=0)
 
@@ -312,12 +356,41 @@ def solve_schedule():
     sim_start_time = datetime.datetime.now().replace(hour=SHIFT_START_HOUR, minute=SHIFT_START_MIN, second=0, microsecond=0)
     if datetime.datetime.now().hour >= SHIFT_END_HOUR:
         sim_start_time += datetime.timedelta(days=1)
+    
+    # Ensure simulation starts on a working day (check against first resource)
+    if resources:
+        first_res_id = resources[0]['ResourcesId']
+        test_date = sim_start_time
+        attempts = 0
+        while get_resource_working_minutes_for_date(first_res_id, test_date) == 0 and attempts < 7:
+            print(f"   > Skipping non-working day: {test_date.strftime('%A, %Y-%m-%d')}")
+            test_date += datetime.timedelta(days=1)
+            attempts += 1
+        if attempts > 0:
+            sim_start_time = test_date
+    
+    print(f"   > Simulation Start: {sim_start_time.strftime('%A, %Y-%m-%d %H:%M')}")
 
     # 3. BUILD MODEL
     print("   > Building Mathematical Model...")
     model = cp_model.CpModel()
     task_vars = {}
-    horizon = 60 * SHIFT_DURATION_MINUTES 
+    
+    # Calculate a more realistic horizon based on actual working days
+    # Use 60 calendar days, but calculate actual working minutes for resources
+    planning_days = 90
+    max_working_minutes = 0
+    for res_id in [r['ResourcesId'] for r in resources]:
+        total_working_mins = 0
+        current_date = sim_start_time
+        for day in range(planning_days):
+            check_date = current_date + datetime.timedelta(days=day)
+            total_working_mins += get_resource_working_minutes_for_date(res_id, check_date)
+        max_working_minutes = max(max_working_minutes, total_working_mins)
+    
+    # Use the maximum available working time across all resources as horizon
+    horizon = max(max_working_minutes, 60 * SHIFT_DURATION_MINUTES)  # Fallback to old value if calculation fails
+    print(f"   > Planning Horizon: {horizon} working minutes ({horizon // SHIFT_DURATION_MINUTES} equivalent shifts)") 
 
     lateness_vars = []
     resource_usage_vars = collections.defaultdict(list)
@@ -676,6 +749,62 @@ def solve_schedule():
 
         # 9c. Save to Database
         results_writer.save_schedule(db_save_list)
+
+        # 9c.1 VALIDATE: Check if tasks are scheduled on non-working days
+        print("\n" + "="*80)
+        print("✅ SCHEDULE VALIDATION: Checking for non-working day violations")
+        print("="*80)
+        violations = []
+        weekday_names_short = ['Mon', 'Tue', 'Wed', 'Thu', 'Fri', 'Sat', 'Sun']
+        
+        for entry in db_save_list:
+            if entry['resource_id']:
+                start_date = entry['start_time']
+                end_date = entry['end_time']
+                res_id = entry['resource_id']
+                
+                # Check each day the task spans
+                current_date = start_date.replace(hour=0, minute=0, second=0, microsecond=0)
+                end_check = end_date.replace(hour=0, minute=0, second=0, microsecond=0)
+                
+                while current_date <= end_check:
+                    working_mins = get_resource_working_minutes_for_date(res_id, current_date)
+                    if working_mins == 0:
+                        # Task scheduled on non-working day
+                        res_name = res_id_to_name.get(res_id, str(res_id))
+                        violations.append({
+                            'order': entry['orno'],
+                            'op': entry['opno'],
+                            'resource': res_name,
+                            'date': current_date,
+                            'day': weekday_names_short[current_date.weekday()]
+                        })
+                    current_date += datetime.timedelta(days=1)
+        
+        if violations:
+            print(f"⚠️  WARNING: Found {len(violations)} task(s) scheduled on non-working days:")
+            for i, v in enumerate(violations[:10]):  # Show first 10
+                print(f"   {i+1}. Order {v['order']}-Op{v['op']} on {v['resource']} - {v['day']} {v['date'].strftime('%Y-%m-%d')}")
+            if len(violations) > 10:
+                print(f"   ... and {len(violations) - 10} more violations")
+            
+            # Show detailed debug for first violation
+            if violations:
+                first_viol = violations[0]
+                print(f"\n   DEBUG - First Violation Details:")
+                matching_entry = next((e for e in db_save_list if e['orno'] == first_viol['order'] and e['opno'] == first_viol['op']), None)
+                if matching_entry:
+                    print(f"   Task Start: {matching_entry['start_time'].strftime('%A %Y-%m-%d %H:%M')}")
+                    print(f"   Task End:   {matching_entry['end_time'].strftime('%A %Y-%m-%d %H:%M')}")
+                    print(f"   Resource:   {first_viol['resource']} (ID: {matching_entry['resource_id']})")
+                    res_sched_id = res_to_schedule.get(matching_entry['resource_id'])
+                    if res_sched_id and res_sched_id in schedule_map:
+                        sched = schedule_map[res_sched_id]
+                        print(f"   Schedule:   {sched.get('Name', 'Unknown')}")
+                        print(f"   Working Days: Mon={sched.get('Monday')}, Tue={sched.get('Tuesday')}, Wed={sched.get('Wednesday')}, Thu={sched.get('Thursday')}, Fri={sched.get('Friday')}, Sat={sched.get('Saturday')}, Sun={sched.get('Sunday')}")
+        else:
+            print("✅ All tasks scheduled on valid working days!")
+        print("="*80 + "\n")
 
         # 9d. Print Stats
         print("\n" + "-" * 50)
