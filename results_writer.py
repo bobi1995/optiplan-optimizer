@@ -1,14 +1,16 @@
 import pymssql
 from typing import List, Dict, Any
 import database_handler 
+import datetime
 
 def save_schedule(schedule_data: List[Dict[str, Any]]):
     """
-    Truncates [BicycleDemo] orders and inserts new schedule with IDENTITY_INSERT ON.
+    Updates existing Orders records with calculated schedule (start_time, end_time, resource_id, etc.).
+    Now uses UPDATE strategy instead of TRUNCATE/INSERT.
     """
     conn = None
     try:
-        print(f"\n   > 💾 Saving {len(schedule_data)} rows to [BicycleDemo]...")
+        print(f"\n   > 💾 Updating {len(schedule_data)} orders in database...")
         
         conn = pymssql.connect(
             server=database_handler.SERVER,
@@ -19,59 +21,53 @@ def save_schedule(schedule_data: List[Dict[str, Any]]):
         )
         cursor = conn.cursor()
 
-        # 1. Clear Old Data
-        cursor.execute("TRUNCATE TABLE [BicycleDemo].[dbo].[Orders]")
-        
-        # 2. ENABLE EXPLICIT ID INSERTION (Critical for preserving IDs)
-        cursor.execute("SET IDENTITY_INSERT [BicycleDemo].[dbo].[Orders] ON")
+        # Mark start of scheduling operation
+        scheduled_at = datetime.datetime.now()
 
-        # 3. Insert Data
+        # Update each order with its calculated schedule
         sql = """
-            INSERT INTO [BicycleDemo].[dbo].[Orders] (
-                [id], [orno], [opno], 
-                [start_time], [end_time], 
-                [project], [duration], [task_index], 
-                [part_no], [product], [op_name], 
-                [remaining_quan], [setup_time], 
-                [resource_id], [resource_group_id], 
-                [belongs_to_order], [due_date], 
-                [order_start], [order_end]
-            ) VALUES (
-                %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s
-            )
+            UPDATE [BicycleDemo].[dbo].[Orders]
+            SET 
+                [start_time] = %s,
+                [end_time] = %s,
+                [resource_id] = %s,
+                [order_start] = %s,
+                [order_end] = %s,
+                [setup_time] = %s,
+                [isScheduled] = 1,
+                [scheduled_at] = %s
+            WHERE [id] = %s
         """
 
-        data_to_insert = []
+        updates = []
         for row in schedule_data:
-            data_to_insert.append((
-                row['id'],              
-                row['orno'],            
-                row['opno'],            
+            updates.append((
                 row['start_time'],      
                 row['end_time'],        
-                None, # project 
-                row['duration'],        
-                None, # task_index 
-                row['part_no'],        
-                row['product'],
-                row['op_name'],         
-                row['remaining_quan'],  
-                row['setup_time'],      
                 row['resource_id'],     
-                row['resource_group_id'], 
-                row['belongs_to_order'], 
-                row['due_date'],        
                 row['order_start'],     
-                row['order_end']        
+                row['order_end'],       
+                row['setup_time'],      
+                scheduled_at,
+                row['id']               # WHERE id = ?
             ))
 
-        cursor.executemany(sql, data_to_insert)
+        # Execute batch update
+        cursor.executemany(sql, updates)
         
-        # 4. DISABLE EXPLICIT ID INSERTION (Cleanup)
-        cursor.execute("SET IDENTITY_INSERT [BicycleDemo].[dbo].[Orders] OFF")
+        # Mark any orders that weren't scheduled (if they exist in DB but not in schedule_data)
+        scheduled_ids = [row['id'] for row in schedule_data]
+        if scheduled_ids:
+            placeholders = ','.join(['%s'] * len(scheduled_ids))
+            cursor.execute(f"""
+                UPDATE [BicycleDemo].[dbo].[Orders]
+                SET [isScheduled] = 0
+                WHERE [id] NOT IN ({placeholders}) AND [isActive] = 1
+            """, scheduled_ids)
         
         conn.commit()
-        print("   ✅ Data saved successfully to SQL Server.")
+        print(f"   ✅ Successfully updated {len(schedule_data)} orders in database.")
+        print(f"   📅 Scheduled at: {scheduled_at.strftime('%Y-%m-%d %H:%M:%S')}")
 
     except pymssql.Error as ex:
         print(f"   ❌ DATABASE SAVE ERROR: {ex}")

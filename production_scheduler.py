@@ -41,21 +41,24 @@ def working_minutes_to_real_time(start_datetime, worked_minutes):
 def solve_schedule():
     start_time_perf = time.time()
     print("\n" + "="*80)
-    print("🏭 PRODUCTION SCHEDULER - Final Optimized Version")
-    print(f"   > Gravity Strategy: {'ENABLED' if ENABLE_GRAVITY_STRATEGY else 'DISABLED'}")
+    print("🏭 PRODUCTION SCHEDULER - Unified Orders Optimizer")
+    print(f"   > Strategy: {'Pull Left (Gravity)' if ENABLE_GRAVITY_STRATEGY else 'Allow Float'}")
+    print(f"   > Data Source: Unified Orders table (Single Source of Truth)")
     print("="*80)
 
     # 1. LOAD DATA
     try:
-        # database_handler handles fetching raw data
+        # database_handler fetches from unified Orders table
         raw_orders, bom, resources, groups, mappings, order_attrs, attributes, attr_params, changeover_groups, changeover_times, changeover_data, schedules, shifts, breaks, break_shift_rel = database_handler.get_data()
     except Exception as e:
         print(f"❌ Error loading data: {e}")
         return
 
     if not raw_orders:
-        print("❌ Aborting: No orders returned.")
+        print("❌ Aborting: No active orders found in database.")
         return
+    
+    print(f"   > Loaded {len(raw_orders)} active orders for scheduling")
 
     # 2. PRE-PROCESSING
     print("   > Pre-processing data...")
@@ -498,8 +501,12 @@ def solve_schedule():
         if len(intervals) > 1:
             model.AddNoOverlap(intervals)
 
-    # 6a. SEQUENCE-DEPENDENT SETUP TIMES
-    print("   > Adding changeover constraints...")
+    # 6a. SEQUENCE-DEPENDENT SETUP TIMES WITH ATTRIBUTE GROUPING
+    print("   > Adding changeover constraints and grouping optimization...")
+    
+    # Track changeover cost variables for optimization
+    changeover_cost_vars = []
+    
     for res_id, task_list in res_tasks.items():
         if len(task_list) < 2:
             continue  # No sequencing needed for single task
@@ -507,34 +514,55 @@ def solve_schedule():
         # For each pair of tasks that could run on this resource
         for i, (task_i, sel_i) in enumerate(task_list):
             for j, (task_j, sel_j) in enumerate(task_list):
-                if i == j:
-                    continue
+                if i >= j:
+                    continue  # Only need one direction and avoid self
                 
-                # Create a literal: "task_i runs before task_j on this resource"
-                precedence_lit = model.NewBoolVar(f'prec_{task_i}_before_{task_j}_on_{res_id}')
+                # Create ordering variables: is task_i before task_j?
+                i_before_j = model.NewBoolVar(f'order_{task_i}_before_{task_j}_res{res_id}')
                 
-                # If both tasks are on this resource AND i comes before j
+                # If both tasks are on this resource, one must come before the other
                 both_on_resource = model.NewBoolVar(f'both_{task_i}_{task_j}_on_{res_id}')
                 model.AddBoolAnd([sel_i, sel_j]).OnlyEnforceIf(both_on_resource)
                 model.AddBoolOr([sel_i.Not(), sel_j.Not()]).OnlyEnforceIf(both_on_resource.Not())
                 
-                # If task_i ends before task_j starts, then precedence_lit = True
-                model.Add(task_vars[task_j]['start'] >= task_vars[task_i]['end']).OnlyEnforceIf([both_on_resource, precedence_lit])
+                # Define ordering: if i_before_j, then end_i <= start_j
+                # Calculate changeover time for both directions
+                changeover_i_to_j = get_changeover_time(task_i, task_j, res_id)
+                changeover_j_to_i = get_changeover_time(task_j, task_i, res_id)
                 
-                # Calculate changeover time for this transition
-                changeover_mins = get_changeover_time(task_i, task_j, res_id)
+                # If i comes before j on this resource
+                if changeover_i_to_j > 0:
+                    changeover_mins_int = int(round(changeover_i_to_j))
+                    model.Add(task_vars[task_j]['start'] >= task_vars[task_i]['end'] + changeover_mins_int).OnlyEnforceIf([both_on_resource, i_before_j])
+                    
+                    # Add to changeover cost (penalize attribute changes)
+                    changeover_cost_var = model.NewIntVar(0, changeover_mins_int, f'cost_{task_i}_to_{task_j}_res{res_id}')
+                    model.Add(changeover_cost_var == changeover_mins_int).OnlyEnforceIf([both_on_resource, i_before_j])
+                    model.Add(changeover_cost_var == 0).OnlyEnforceIf([both_on_resource.Not()])
+                    model.Add(changeover_cost_var == 0).OnlyEnforceIf([i_before_j.Not()])
+                    changeover_cost_vars.append(changeover_cost_var)
+                else:
+                    model.Add(task_vars[task_j]['start'] >= task_vars[task_i]['end']).OnlyEnforceIf([both_on_resource, i_before_j])
                 
-                # If this precedence is active, the setup time of task_j includes the changeover
-                # We'll use a more sophisticated approach: track if task_j is first on resource
-                
-                # For simplicity, we'll add the constraint:
-                # If task_i immediately precedes task_j on this resource, add changeover to task_j's setup
-                if changeover_mins > 0:
-                    # This is a simplified version - in production you'd want to track immediate predecessors
-                    # For now, if both are on resource and i ends before j starts, add changeover buffer
-                    # Convert to integer for CP-SAT
-                    changeover_mins_int = int(round(changeover_mins))
-                    model.Add(task_vars[task_j]['start'] >= task_vars[task_i]['end'] + changeover_mins_int).OnlyEnforceIf([both_on_resource, precedence_lit])
+                # If j comes before i on this resource
+                if changeover_j_to_i > 0:
+                    changeover_mins_int = int(round(changeover_j_to_i))
+                    model.Add(task_vars[task_i]['start'] >= task_vars[task_j]['end'] + changeover_mins_int).OnlyEnforceIf([both_on_resource, i_before_j.Not()])
+                    
+                    # Add to changeover cost
+                    changeover_cost_var = model.NewIntVar(0, changeover_mins_int, f'cost_{task_j}_to_{task_i}_res{res_id}')
+                    model.Add(changeover_cost_var == changeover_mins_int).OnlyEnforceIf([both_on_resource, i_before_j.Not()])
+                    model.Add(changeover_cost_var == 0).OnlyEnforceIf([both_on_resource.Not()])
+                    model.Add(changeover_cost_var == 0).OnlyEnforceIf([i_before_j])
+                    changeover_cost_vars.append(changeover_cost_var)
+                else:
+                    model.Add(task_vars[task_i]['start'] >= task_vars[task_j]['end']).OnlyEnforceIf([both_on_resource, i_before_j.Not()])
+    
+    # Calculate total changeover cost
+    total_changeover_cost = model.NewIntVar(0, horizon * len(raw_orders), 'total_changeover_cost')
+    if changeover_cost_vars:
+        model.Add(total_changeover_cost == sum(changeover_cost_vars))
+        print(f"   > Tracking {len(changeover_cost_vars)} potential changeover transitions")
     
     # For now, initialize all setup times to 0 (will be refined with better sequencing logic)
     for oid in setup_time_vars:
@@ -565,17 +593,24 @@ def solve_schedule():
             model.Add(load_range == max_load - min_load)
 
     # --- WEIGHTED OBJECTIVE ---
+    # PRIORITY ORDER:
+    # 1. Meet Due Dates (Critical - Must satisfy)
+    # 2. Minimize Changeovers (NEW - Group same attributes = Huge savings!)
+    # 3. Finish Fast (Makespan)
+    # 4. Balance Resources
+    # 5. Pull tasks left (Gravity)
     objective_terms = [
-        (total_lateness * 10000),   # 1. Meet Due Dates (Critical)
-        (makespan * 100),           # 2. Finish Project Fast
-        (load_range * 50),          # 3. Balance Loads
-        (max_load * 1)              # 4. Reduce Peak Load
+        (total_lateness * 10000),      # 1. Meet Due Dates (Critical)
+        (total_changeover_cost * 500), # 2. Minimize Changeovers (HIGH PRIORITY - groups same colors/attributes!)
+        (makespan * 100),              # 3. Finish Project Fast
+        (load_range * 50),             # 4. Balance Loads
+        (max_load * 1)                 # 5. Reduce Peak Load
     ]
 
     if ENABLE_GRAVITY_STRATEGY:
         total_start_time = model.NewIntVar(0, horizon * len(raw_orders), 'total_start')
         model.Add(total_start_time == sum(t['start'] for t in task_vars.values()))
-        objective_terms.append(total_start_time * 1) # 5. Gravity (Pull Left)
+        objective_terms.append(total_start_time * 1) # 6. Gravity (Pull Left)
 
     model.Minimize(sum(objective_terms))
 
@@ -597,6 +632,7 @@ def solve_schedule():
         print(f"Status          : {solver.StatusName(status)}")
         print(f"Computation Time: {end_time_perf - start_time_perf:.2f}s")
         print(f"Total Lateness  : {solver.Value(total_lateness)} min")
+        print(f"Total Changeovers: {solver.Value(total_changeover_cost)} min (minimized by grouping same attributes)")
         print(f"Project Length  : {solver.Value(makespan)} min")
         
         output_list = []

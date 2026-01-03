@@ -11,6 +11,7 @@ PASSWORD = 'evrista_pass359'
 def get_data() -> Tuple[List[Dict], List[Dict], List[Dict], List[Dict], List[Dict], List[Dict], List[Dict], List[Dict], List[Dict], List[Dict], List[Dict], List[Dict], List[Dict], List[Dict]]:
     """
     Fetches Orders/BOM/Resources from databases, plus Changeover and Schedule configuration.
+    NOW READS FROM UNIFIED Orders TABLE (no more Orders_Raw).
     Returns: orders, bom, resources, groups, mappings, order_attrs, attributes, attr_params, changeover_groups, changeover_times, changeover_data, schedules, shifts, breaks, break_shift_rel
     """
     conn = None
@@ -19,16 +20,27 @@ def get_data() -> Tuple[List[Dict], List[Dict], List[Dict], List[Dict], List[Dic
         conn = pymssql.connect(server=SERVER, port=PORT, user=USER, password=PASSWORD, database=DATABASE)
         cursor = conn.cursor(as_dict=True)
 
-        # 1. FETCH RAW ORDERS (Now from BicycleDemo)
-        print("   > Fetching Orders_Raw (Source)...")
+        # 1. FETCH ORDERS (Now from unified Orders table)
+        print("   > Fetching Orders (Unified Source)...")
         cursor.execute("""
             SELECT 
-                OrdersId, BelongsToOrderNo, OrderNo, DueDate, 
-                ResourceGroup, OpTimePerItem, TotalSetupTime, 
-                TotalProcessTime, Quantity, OperationName, OpNo,
-                EarliestStartDate, DemandDate,
-                PartNo, Product  
-            FROM [BicycleDemo].[dbo].[Orders_Raw]
+                id AS OrdersId,
+                belongs_to_order AS BelongsToOrderNo,
+                orno AS OrderNo,
+                due_date AS DueDate,
+                resource_group_id AS ResourceGroup,
+                OpTimePerItem,
+                setup_time AS TotalSetupTime,
+                duration AS TotalProcessTime,
+                remaining_quan AS Quantity,
+                op_name AS OperationName,
+                opno AS OpNo,
+                EarliestStartDate,
+                DemandDate,
+                part_no AS PartNo,
+                product AS Product
+            FROM [BicycleDemo].[dbo].[Orders]
+            WHERE isActive = 1
         """)
         orders = list(cursor)
 
